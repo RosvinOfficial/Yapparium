@@ -29,14 +29,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except ImportError:  # pragma: no cover
-    genai = None
-    genai_types = None
-
-
+import aiohttp
 # --------------------------------------------------------------------------- #
 #                                CONFIGURATION                                #
 # --------------------------------------------------------------------------- #
@@ -390,102 +383,286 @@ class DatabaseManager:
 # --------------------------------------------------------------------------- #
 
 class AIManager:
-    """Manages Gemini AI interactions and per-user conversational memory."""
+    """Gemini AI manager using the REST API directly through aiohttp."""
 
     SYSTEM_INSTRUCTION = (
-        "You are a helpful, friendly Discord bot assistant. Keep responses natural, "
-        "conversational, and concise unless the user asks for detail. You have memory "
-        "of the recent conversation with this user."
+        "You are a helpful, friendly Discord bot assistant. "
+        "Keep responses natural, conversational, and concise unless "
+        "the user asks for detail. You have memory of the recent "
+        "conversation with this user."
     )
 
-    def __init__(self, db: DatabaseManager, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        db: DatabaseManager,
+        api_key: str,
+        model: str,
+    ) -> None:
         self.db = db
+        self.api_key = api_key
         self.model = model
-        self._client = None
-        if genai is not None and api_key:
-            self._client = genai.Client(api_key=api_key)
         self._locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def is_ready(self) -> bool:
-        return self._client is not None
+        return bool(self.api_key)
 
-    async def generate_response(self, user_id: int, prompt: str) -> str:
-        """Generate an AI response for a user, maintaining conversation history."""
+    async def generate_response(
+        self,
+        user_id: int,
+        prompt: str,
+    ) -> str:
+
         if not self.is_ready():
-            return "The AI system is not configured correctly. Please contact the bot owner."
+            return (
+                "The AI system is not configured correctly. "
+                "Please contact the bot owner."
+            )
 
         async with self._locks[user_id]:
-            await self.db.add_message(user_id, "user", prompt)
-            history_rows = await self.db.get_history(user_id, Config.AI_MAX_HISTORY)
 
-            contents: List[Any] = []
+            await self.db.add_message(
+                user_id,
+                "user",
+                prompt,
+            )
+
+            history_rows = await self.db.get_history(
+                user_id,
+                Config.AI_MAX_HISTORY,
+            )
+
+            contents = []
+
             for row in history_rows:
-                role = "user" if row["role"] == "user" else "model"
-                contents.append(
-                    genai_types.Content(
-                        role=role, parts=[genai_types.Part.from_text(text=row["content"])]
-                    )
+
+                role = (
+                    "user"
+                    if row["role"] == "user"
+                    else "model"
                 )
 
-            response_text = await self._call_with_retry(contents)
-            await self.db.add_message(user_id, "assistant", response_text)
-            await self.db.trim_history(user_id, Config.AI_MAX_HISTORY * 2)
+                contents.append(
+                    {
+                        "role": role,
+                        "parts": [
+                            {
+                                "text": row["content"]
+                            }
+                        ],
+                    }
+                )
+
+            response_text = await self._call_with_retry(
+                contents
+            )
+
+            await self.db.add_message(
+                user_id,
+                "assistant",
+                response_text,
+            )
+
+            await self.db.trim_history(
+                user_id,
+                Config.AI_MAX_HISTORY * 2,
+            )
+
             return response_text
 
-    async def _call_with_retry(self, contents: List[Any]) -> str:
-        last_error: Optional[Exception] = None
-        for attempt in range(Config.AI_MAX_RETRIES):
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(self._generate_sync, contents), timeout=45
-                )
-            except asyncio.TimeoutError as exc:
-                last_error = exc
-                logger.warning("Gemini call timed out (attempt %d)", attempt + 1)
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                logger.warning("Gemini call failed (attempt %d): %s", attempt + 1, exc)
-            await asyncio.sleep(Config.AI_RETRY_BASE_DELAY * (attempt + 1))
-        logger.error("Gemini call failed after retries: %s", last_error)
-        return "Sorry, I'm having trouble reaching the AI service right now. Please try again shortly."
+    async def _call_with_retry(
+        self,
+        contents: List[Any],
+    ) -> str:
 
-    def _generate_sync(self, contents: List[Any]) -> str:
-        assert self._client is not None
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=self.SYSTEM_INSTRUCTION,
-                max_output_tokens=Config.AI_MAX_OUTPUT_TOKENS,
-                temperature=0.9,
-            ),
+        last_error = None
+
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{self.model}:generateContent"
         )
-        text = getattr(response, "text", None)
-        if not text:
-            return "I couldn't generate a response for that. Could you rephrase?"
-        return text.strip()
+
+        payload = {
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": self.SYSTEM_INSTRUCTION
+                    }
+                ]
+            },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.9,
+                "maxOutputTokens": (
+                    Config.AI_MAX_OUTPUT_TOKENS
+                ),
+            },
+        }
+
+        timeout = aiohttp.ClientTimeout(
+            total=45
+        )
+
+        for attempt in range(
+            Config.AI_MAX_RETRIES
+        ):
+
+            try:
+
+                async with aiohttp.ClientSession(
+                    timeout=timeout
+                ) as session:
+
+                    async with session.post(
+                        url,
+                        params={
+                            "key": self.api_key
+                        },
+                        json=payload,
+                    ) as response:
+
+                        data = await response.json(
+                            content_type=None
+                        )
+
+                        if response.status != 200:
+
+                            error_message = (
+                                data.get(
+                                    "error",
+                                    {},
+                                ).get(
+                                    "message",
+                                    "Unknown Gemini API error",
+                                )
+                            )
+
+                            raise RuntimeError(
+                                f"Gemini API "
+                                f"{response.status}: "
+                                f"{error_message}"
+                            )
+
+                        candidates = data.get(
+                            "candidates",
+                            [],
+                        )
+
+                        if not candidates:
+
+                            return (
+                                "I couldn't generate a "
+                                "response. Please try again."
+                            )
+
+                        parts = (
+                            candidates[0]
+                            .get(
+                                "content",
+                                {},
+                            )
+                            .get(
+                                "parts",
+                                [],
+                            )
+                        )
+
+                        text = "".join(
+                            part.get(
+                                "text",
+                                "",
+                            )
+                            for part in parts
+                        ).strip()
+
+                        if text:
+                            return text
+
+                        return (
+                            "I couldn't generate a "
+                            "response. Please rephrase."
+                        )
+
+            except asyncio.TimeoutError as exc:
+
+                last_error = exc
+
+                logger.warning(
+                    "Gemini request timed out "
+                    "(attempt %d)",
+                    attempt + 1,
+                )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                logger.warning(
+                    "Gemini request failed "
+                    "(attempt %d): %s",
+                    attempt + 1,
+                    exc,
+                )
+
+            await asyncio.sleep(
+                Config.AI_RETRY_BASE_DELAY
+                * (attempt + 1)
+            )
+
+        logger.error(
+            "Gemini failed after retries: %s",
+            last_error,
+        )
+
+        return (
+            "Sorry, I'm having trouble reaching "
+            "the AI service right now. "
+            "Please try again shortly."
+        )
 
     @staticmethod
-    def split_message(text: str, limit: int = Config.DISCORD_MSG_LIMIT) -> List[str]:
-        """Split a long message into Discord-safe chunks, preferring line breaks."""
+    def split_message(
+        text: str,
+        limit: int = Config.DISCORD_MSG_LIMIT,
+    ) -> List[str]:
+
         if len(text) <= limit:
             return [text]
 
-        chunks: List[str] = []
+        chunks = []
         remaining = text
+
         while len(remaining) > limit:
-            split_at = remaining.rfind("\n", 0, limit)
+
+            split_at = remaining.rfind(
+                "\n",
+                0,
+                limit,
+            )
+
             if split_at == -1:
-                split_at = remaining.rfind(" ", 0, limit)
+
+                split_at = remaining.rfind(
+                    " ",
+                    0,
+                    limit,
+                )
+
             if split_at == -1:
                 split_at = limit
-            chunks.append(remaining[:split_at])
-            remaining = remaining[split_at:].lstrip()
+
+            chunks.append(
+                remaining[:split_at]
+            )
+
+            remaining = (
+                remaining[split_at:]
+                .lstrip()
+            )
+
         if remaining:
             chunks.append(remaining)
+
         return chunks
-
-
 # --------------------------------------------------------------------------- #
 #                                LOGGING MANAGER                              #
 # --------------------------------------------------------------------------- #
