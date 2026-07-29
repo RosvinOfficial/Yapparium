@@ -1578,9 +1578,7 @@ def main() -> None:
     _colored_log(f"Database path: {Config.DB_PATH}", Colors.CYAN)
     _colored_log(f"Gemini model: {Config.GEMINI_MODEL}", Colors.CYAN)
 
-    if genai is None:
-        _colored_log("google-genai package not installed. AI features will be disabled.", Colors.YELLOW)
-
+    _colored_log("Gemini REST API is enabled.", Colors.GREEN)
     bot = ModBot()
 
     try:
